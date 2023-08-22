@@ -1,0 +1,72 @@
+﻿using GeekShopping.PaymentApi.Messages;
+using GeekShopping.PaymentApi.RabbitMqSender;
+using GeekShopping.PaymentProcessor;
+
+using RabbitMQ.Client;
+using RabbitMQ.Client.Events;
+
+using System.Text;
+using System.Text.Json;
+
+namespace GeekShopping.PaymentApi.MessageConsumer;
+
+public class RabbitMQPaymentConsumer : BackgroundService
+{
+    private IConnection _connection;
+    private IModel _channel;
+    private IRabbitMQMessageSender _messageSender;
+    private readonly IProcessPayment _processPayment;
+
+    public RabbitMQPaymentConsumer(IProcessPayment processPayment, IRabbitMQMessageSender messageSender)
+    {
+        _processPayment = processPayment;
+
+        var factory = new ConnectionFactory
+        {
+            HostName = "localhost",
+            UserName = "guest",
+            Password = "guest",
+        };
+        _connection = factory.CreateConnection();
+
+        _channel = _connection.CreateModel();
+        _channel.QueueDeclare("orderpaymentprocessqueue", false, false, false);
+        _messageSender = messageSender;
+
+    }
+
+    protected override Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        stoppingToken.ThrowIfCancellationRequested();
+        var consumer = new EventingBasicConsumer(_channel);
+        consumer.Received += (channel, evt) =>
+        {
+            var content = Encoding.UTF8.GetString(evt.Body.ToArray());
+            var vo = JsonSerializer.Deserialize<PaymentMessage>(content) ?? new PaymentMessage();
+            ProcessPayment(vo).GetAwaiter().GetResult();
+            _channel.BasicAck(evt.DeliveryTag, false);
+        };
+        _channel.BasicConsume("orderpaymentprocessqueue", false, consumer);
+        return Task.CompletedTask;
+    }
+
+    private async Task ProcessPayment(PaymentMessage vo)
+    {
+        var result = _processPayment.PaymentProcessor();
+        var paymentResult = new UpdatePaymentResultMessage
+        {
+            Status = result,
+            Email = vo.Email,
+            OrderId = vo.OrderId,
+        };
+        try
+        {
+            _messageSender.SendMessage(paymentResult);
+        }
+        catch (Exception)
+        {
+            //Log
+            throw;
+        }
+    }
+}
